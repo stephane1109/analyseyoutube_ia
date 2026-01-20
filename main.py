@@ -2,26 +2,16 @@
 """
 Application Streamlit Cloud : comparaison SHS de la proportion de vidéos "marquées IA" entre deux ensembles.
 
-Objectif typique :
-Comparer "climatosceptique" vs "climat" sur la proportion de vidéos déclarant un contenu altéré/synthétique.
+Usage :
+- L'utilisateur saisit sa clé API YouTube (champ masqué) directement dans l'application.
+- L'utilisateur peut construire un corpus soit par "Chaînes seed" (recommandé), soit par recherche à partir d'un mot-clé/hashtag.
+- Marqueur IA principal : status.containsSyntheticMedia (quand il est disponible). Son absence = "inconnu".
+- Analyse : proportions par chaîne + test de permutation au niveau des chaînes (robuste face à la non-indépendance vidéo/chaîne).
+- Analyse de sensibilité : mode "exclure", "basse" (inconnu=0), "haute" (inconnu=1).
 
-Marqueur IA principal (YouTube Data API v3) :
-- videos.list(part="status") renvoie parfois status.containsSyntheticMedia (True/False).
-- Si le champ est absent, l'information est inconnue (ne pas interpréter comme "non IA").
-
-Deux modes de constitution de corpus :
-- Mode "Chaînes seed" : tu fournis un CSV de chaînes avec un groupe (recommandé pour une comparaison robuste).
-- Mode "Recherche" : tu pars d'une requête/hashtag via search.list (exploratoire, quota élevé, biais de ranking).
-
-Statistiques :
-- Unité d'observation recommandée : la chaîne.
-- On calcule une proportion de vidéos "IA déclarée" par chaîne, puis on compare les groupes.
-- Test principal : permutation au niveau des chaînes (robuste à la non-indépendance vidéo/chaîne).
-- Analyse de sensibilité : borne basse (inconnu = 0), borne haute (inconnu = 1), et mode "exclure les inconnus".
-
-Déploiement Streamlit Cloud :
-- Définir YOUTUBE_API_KEY dans Secrets (Settings -> Secrets) :
-  YOUTUBE_API_KEY = "TA_CLE_API"
+Remarques :
+- La recherche par mot-clé/hashtag utilise search.list : cela coûte plus de quota et produit un corpus exploratoire (biais de ranking).
+- Le mode "Chaînes seed" (liste de chaînes figée + N dernières vidéos) est préférable pour une comparaison défendable.
 """
 
 from __future__ import annotations
@@ -29,9 +19,8 @@ from __future__ import annotations
 import os
 import time
 import math
-import hashlib
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -47,20 +36,20 @@ class ParametresAPI:
     nb_tentatives: int = 5
 
 
-def lire_cle_api_streamlit() -> str:
-    if "YOUTUBE_API_KEY" in st.secrets:
-        cle = str(st.secrets["YOUTUBE_API_KEY"]).strip()
-        if cle:
-            return cle
-    env = os.getenv("YOUTUBE_API_KEY", "").strip()
-    if env:
-        return env
-    raise ValueError("Clé API absente. Ajoute YOUTUBE_API_KEY dans Secrets Streamlit Cloud ou en variable d'environnement.")
-
-
-@st.cache_resource(show_spinner=False)
-def creer_service_youtube(cle_api: str):
-    return build("youtube", "v3", developerKey=cle_api, cache_discovery=False)
+def normaliser_requete(mot_cle: str, mode_hashtag: bool) -> str:
+    """
+    Si mode_hashtag=True et que l'utilisateur entre "climatic", on transforme en "#climatic".
+    Si l'utilisateur entre déjà "#climatic", on conserve tel quel.
+    Si mode_hashtag=False, on renvoie la requête telle quelle (recherche libre).
+    """
+    q = (mot_cle or "").strip()
+    if not q:
+        return ""
+    if mode_hashtag:
+        if q.startswith("#"):
+            return q
+        return "#" + q
+    return q
 
 
 def requete_robuste(appel, nb_tentatives: int = 5, pause_initiale: float = 1.0):
@@ -96,6 +85,11 @@ def heuristique_indice_ia(titre: str, description: str) -> int:
         "midjourney", "stable diffusion", "suno", "elevenlabs", "heygen", "d-id"
     ]
     return 1 if any(m in t for m in mots) else 0
+
+
+@st.cache_resource(show_spinner=False)
+def creer_service_youtube(cle_api: str):
+    return build("youtube", "v3", developerKey=cle_api, cache_discovery=False)
 
 
 def recuperer_playlist_uploads(service, channel_id: str, params: ParametresAPI) -> str:
@@ -148,6 +142,7 @@ def recuperer_details_videos(service, video_ids: List[str], params: ParametresAP
             stt = v.get("statistics", {})
             cd = v.get("contentDetails", {})
             status = v.get("status", {})
+
             lignes.append({
                 "video_id": v.get("id"),
                 "channel_id": sn.get("channelId"),
@@ -162,8 +157,10 @@ def recuperer_details_videos(service, video_ids: List[str], params: ParametresAP
                 "nb_commentaires": _safe_int(stt.get("commentCount")),
                 "containsSyntheticMedia": status.get("containsSyntheticMedia")
             })
+
         if params.delai_requete > 0:
             time.sleep(params.delai_requete)
+
     return pd.DataFrame(lignes)
 
 
@@ -176,6 +173,7 @@ def collecter_mode_chaines(
 ) -> pd.DataFrame:
     corpus = []
     total = len(df_chaines)
+
     for i, r in df_chaines.reset_index(drop=True).iterrows():
         channel_id = str(r["channel_id"]).strip()
         groupe = str(r["groupe"]).strip()
@@ -188,21 +186,26 @@ def collecter_mode_chaines(
             video_ids = lister_videos_playlist(service, uploads, max_videos_par_chaine, params)
             if not video_ids:
                 continue
+
             df_vid = recuperer_details_videos(service, video_ids, params)
             if df_vid.empty:
                 continue
+
             df_vid["groupe"] = groupe
             df_vid["mode_collecte"] = "chaines_seed"
             df_vid["requete_source"] = None
-            df_vid["indice_ia_texte"] = df_vid.apply(lambda x: heuristique_indice_ia(x.get("titre"), x.get("description")), axis=1)
+            df_vid["indice_ia_texte"] = df_vid.apply(
+                lambda x: heuristique_indice_ia(x.get("titre"), x.get("description")),
+                axis=1
+            )
             corpus.append(df_vid)
-        except HttpError:
-            continue
+
         except Exception:
             continue
 
     if not corpus:
         return pd.DataFrame()
+
     return pd.concat(corpus, ignore_index=True)
 
 
@@ -254,8 +257,10 @@ def collecter_mode_recherche(
 
     df_vid["mode_collecte"] = "recherche"
     df_vid["requete_source"] = requete
-    df_vid["indice_ia_texte"] = df_vid.apply(lambda x: heuristique_indice_ia(x.get("titre"), x.get("description")), axis=1)
-
+    df_vid["indice_ia_texte"] = df_vid.apply(
+        lambda x: heuristique_indice_ia(x.get("titre"), x.get("description")),
+        axis=1
+    )
     if "groupe" not in df_vid.columns:
         df_vid["groupe"] = ""
 
@@ -275,9 +280,9 @@ def normaliser_statut_ia_declare(val) -> str:
 def proportion_ia_par_chaine(df: pd.DataFrame, mode_inconnu: str) -> pd.DataFrame:
     """
     mode_inconnu :
-    - "exclure" : proportion sur les vidéos où containsSyntheticMedia est renseigné
-    - "basse"   : inconnu = 0
-    - "haute"   : inconnu = 1
+    "exclure" : proportion sur les vidéos où containsSyntheticMedia est renseigné
+    "basse"   : inconnu = 0
+    "haute"   : inconnu = 1
     """
     d = df.copy()
 
@@ -301,7 +306,7 @@ def proportion_ia_par_chaine(df: pd.DataFrame, mode_inconnu: str) -> pd.DataFram
         d["ia_utilisee"] = d["ia_declare"]
 
     if d.empty:
-        return pd.DataFrame(columns=["channel_id", "channel_title", "groupe", "proportion_ia", "n_videos"])
+        return pd.DataFrame(columns=["channel_id", "channel_title", "groupe", "proportion_ia", "n_videos", "part_indice_ia_texte"])
 
     agg = d.groupby(["channel_id", "channel_title", "groupe"]).agg(
         proportion_ia=("ia_utilisee", "mean"),
@@ -314,13 +319,14 @@ def proportion_ia_par_chaine(df: pd.DataFrame, mode_inconnu: str) -> pd.DataFram
 
 def test_permutation_par_chaine(df_prop: pd.DataFrame, n_permutations: int, graine: int = 42, progres_callback=None) -> Dict:
     dfp = df_prop.dropna(subset=["proportion_ia", "groupe"]).copy()
-    groupes = [g for g in dfp["groupe"].unique().tolist() if str(g).strip() != ""]
+    dfp["groupe"] = dfp["groupe"].astype(str).str.strip()
+    groupes = sorted([g for g in dfp["groupe"].unique().tolist() if g != ""])
     if len(groupes) != 2:
-        raise ValueError("Le test de permutation nécessite exactement 2 groupes (colonne 'groupe').")
+        raise ValueError("Le test de permutation nécessite exactement 2 groupes non vides dans la colonne 'groupe'.")
 
     g1, g2 = groupes[0], groupes[1]
     x = dfp["proportion_ia"].to_numpy(dtype=float)
-    labels = dfp["groupe"].astype(str).to_numpy()
+    labels = dfp["groupe"].to_numpy(dtype=str)
 
     masque1 = labels == g1
     masque2 = labels == g2
@@ -338,6 +344,7 @@ def test_permutation_par_chaine(df_prop: pd.DataFrame, n_permutations: int, grai
     for b in range(nb_blocs):
         debut = b * bloc
         fin = min(n_permutations, (b + 1) * bloc)
+
         for _ in range(debut, fin):
             perm = rng.permutation(labels)
             diff = float(x[perm == g1].mean() - x[perm == g2].mean())
@@ -349,7 +356,7 @@ def test_permutation_par_chaine(df_prop: pd.DataFrame, n_permutations: int, grai
 
     p_value = (compte + 1) / (n_permutations + 1)
     return {
-        "difference_moyennes": obs,
+        "difference_moyennes": float(obs),
         "p_value": float(p_value),
         "groupe_1": g1,
         "groupe_2": g2,
@@ -391,202 +398,29 @@ def dataframe_telechargeable(df: pd.DataFrame, nom_fichier: str, cle: str):
 
 def interface_principale():
     st.set_page_config(page_title="YouTube IA et climat (Streamlit Cloud)", layout="wide")
-    st.title("Comparaison de marqueurs IA sur YouTube : climatosceptique versus climat")
+    st.title("YouTube : marqueurs IA et comparaison climatosceptique versus climat")
 
     st.write(
-        "Cette application constitue un corpus de vidéos, récupère le marqueur YouTube `containsSyntheticMedia` quand il est présent, "
-        "et compare des proportions entre deux ensembles. Les vidéos sans marqueur sont traitées comme une information inconnue. "
-        "Pour une comparaison défendable, l’unité d’observation recommandée est la chaîne, pas la vidéo, afin d’éviter la non-indépendance."
+        "Tu peux constituer un corpus de vidéos et comparer la proportion de vidéos qui déclarent un contenu altéré ou synthétique "
+        "entre deux ensembles (par exemple climatosceptiques versus climat). Le champ `containsSyntheticMedia` peut être présent ou absent ; "
+        "en cas d’absence, l’information doit être considérée comme inconnue."
     )
 
-    with st.expander("Méthode et limites (à lire avant de conclure)", expanded=False):
+    with st.expander("Méthode et limites", expanded=False):
         st.write(
-            "Le mode recherche à partir d’un hashtag ou d’une requête utilise `search.list`, qui est coûteux en quota et dépend d’un classement algorithmique. "
-            "Cela produit un corpus exploratoire et non un échantillon aléatoire. Le mode chaînes seed est préférable, car il fige une liste de chaînes et collecte "
-            "les N dernières vidéos de chaque chaîne via la playlist uploads. Le marqueur `containsSyntheticMedia` n’est pas un détecteur universel de l’IA : "
-            "il s’agit d’une divulgation/étiquette quand elle est disponible. L’absence du champ ne signifie pas absence d’IA."
+            "Le mode recherche (mot-clé/hashtag) est exploratoire : il dépend d’un classement algorithmique et il consomme davantage de quota. "
+            "Le mode chaînes seed est recommandé si tu veux une comparaison plus robuste, car tu figes une liste de chaînes et tu récupères les N dernières vidéos "
+            "de chaque chaîne. L’analyse statistique est faite au niveau des chaînes (proportion par chaîne), ce qui limite les biais liés à la non-indépendance "
+            "de plusieurs vidéos publiées par une même chaîne."
         )
 
-    try:
-        cle_api = lire_cle_api_streamlit()
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
-
-    service = creer_service_youtube(cle_api)
-
-    st.subheader("1) Constitution du corpus")
-    mode = st.radio("Choisir un mode", ["Chaînes seed (recommandé)", "Recherche par hashtag/requête (exploratoire)"], horizontal=True)
-
-    params = ParametresAPI(
-        cle_api=cle_api,
-        delai_requete=float(st.slider("Délai entre requêtes (secondes)", 0.0, 1.0, 0.1, 0.05)),
-        nb_tentatives=5
-    )
-
-    prog = st.progress(0)
-    info = st.empty()
-
-    def progres(val, texte):
-        prog.progress(min(1.0, max(0.0, float(val))))
-        info.write(texte)
-
-    df_corpus = None
-
-    if mode.startswith("Chaînes"):
-        st.write(
-            "Le CSV doit contenir au minimum deux colonnes : `channel_id` et `groupe`. "
-            "Le groupe peut être par exemple `climatosceptique` ou `climat`."
-        )
-        fichier = st.file_uploader("Importer un CSV de chaînes seed", type=["csv"])
-        max_videos = st.slider("Nombre de vidéos par chaîne", 5, 200, 50, 5)
-
-        if fichier is not None:
-            df_ch = pd.read_csv(fichier)
-            if "channel_id" not in df_ch.columns or "groupe" not in df_ch.columns:
-                st.error("CSV invalide. Colonnes attendues : channel_id, groupe")
-            else:
-                if st.button("Lancer la collecte (chaînes)", type="primary"):
-                    df_ch = df_ch[["channel_id", "groupe"]].dropna().copy()
-                    df_ch["channel_id"] = df_ch["channel_id"].astype(str).str.strip()
-                    df_ch["groupe"] = df_ch["groupe"].astype(str).str.strip()
-                    df_ch = df_ch[(df_ch["channel_id"] != "") & (df_ch["groupe"] != "")]
-                    df_corpus = collecter_mode_chaines(service, df_ch, int(max_videos), params, progres_callback=progres)
-
-    else:
-        st.write(
-            "La recherche est utile pour repérer des vidéos et des chaînes, mais elle est coûteuse en quota et dépend d’un classement. "
-            "Tu peux ensuite étiqueter le groupe (climatosceptique/climat) dans le tableau avant l’analyse."
-        )
-        requete = st.text_input("Hashtag ou requête", value="#climatic")
-        max_resultats = st.slider("Nombre maximal de vidéos", 20, 500, 150, 10)
-        region = st.text_input("RegionCode optionnel (ex: FR, US)", value="")
-        langue = st.text_input("Langue optionnelle (ex: fr, en)", value="")
-
-        if st.button("Lancer la collecte (recherche)", type="primary"):
-            region_code = region.strip() if region.strip() else None
-            relevance_lang = langue.strip() if langue.strip() else None
-            df_corpus = collecter_mode_recherche(service, requete.strip(), int(max_resultats), params, region_code, relevance_lang, progres_callback=progres)
-
-    prog.progress(0)
-    info.write("")
-
-    if df_corpus is None:
-        st.stop()
-
-    if df_corpus.empty:
-        st.warning("Aucune donnée collectée. Vérifie la clé API, les identifiants, la requête et les quotas.")
-        st.stop()
-
-    df_corpus["ia_declare_statut"] = df_corpus["containsSyntheticMedia"].apply(normaliser_statut_ia_declare)
-
-    st.subheader("2) Option : enrichissement par marquage machine (import CSV)")
+    st.subheader("0) Clé API YouTube Data v3")
     st.write(
-        "Si tu disposes d’une source externe indiquant un marquage machine (present/absent/inconnu), "
-        "tu peux l’importer pour lier ces informations au corpus via `video_id`."
-    )
-    fichier_mm = st.file_uploader("Importer un CSV de marquage machine (video_id, marquage_machine)", type=["csv"], key="mm")
-    if fichier_mm is not None:
-        try:
-            df_mm = pd.read_csv(fichier_mm)
-            df_corpus = fusionner_marquage_machine(df_corpus, df_mm)
-            st.success("Marquage machine fusionné au corpus.")
-        except Exception as e:
-            st.error(str(e))
-
-    st.subheader("3) Vérification et étiquetage des groupes")
-    st.write(
-        "Si la colonne `groupe` est vide (cas fréquent en mode recherche), tu peux la compléter ici. "
-        "L’analyse nécessite exactement deux groupes distincts."
-    )
-    colonnes_affichees = ["video_id", "channel_title", "titre", "published_at", "ia_declare_statut", "indice_ia_texte", "groupe"]
-    if "marquage_machine" in df_corpus.columns:
-        colonnes_affichees.insert(6, "marquage_machine")
-
-    df_edit = st.data_editor(
-        df_corpus[colonnes_affichees].copy(),
-        use_container_width=True,
-        num_rows="dynamic"
+        "L’utilisateur doit saisir une clé API valide. Tu peux aussi pré-remplir via un Secret Streamlit, mais ce n’est pas obligatoire."
     )
 
-    df_corpus = df_corpus.drop(columns=["groupe"], errors="ignore").merge(
-        df_edit[["video_id", "groupe"]].astype({"video_id": str}),
-        on="video_id",
-        how="left"
-    )
+    cle_prefill = ""
+    if "YOUTUBE_API_KEY" in st.secrets:
+        cle_prefill = str(st.secrets.get("YOUTUBE_API_KEY", "")).strip()
 
-    st.subheader("4) Export du corpus")
-    dataframe_telechargeable(df_corpus, "corpus_youtube_ia.csv", "dl_corpus")
-
-    st.subheader("5) Analyse statistique (niveau chaîne)")
-    st.write(
-        "L’analyse calcule une proportion de vidéos IA déclarées par chaîne, puis compare les distributions entre groupes par un test de permutation. "
-        "Trois lectures sont proposées : exclure les inconnus, borne basse (inconnu=0), borne haute (inconnu=1)."
-    )
-
-    n_perm = st.slider("Nombre de permutations", 1000, 50000, 5000, 1000)
-
-    prog2 = st.progress(0)
-    info2 = st.empty()
-
-    def progres2(val, texte):
-        prog2.progress(min(1.0, max(0.0, float(val))))
-        info2.write(texte)
-
-    if st.button("Lancer l'analyse", type="primary"):
-        df_analyse = df_corpus.copy()
-        df_analyse["groupe"] = df_analyse["groupe"].fillna("").astype(str).str.strip()
-
-        groupes = sorted([g for g in df_analyse["groupe"].unique().tolist() if g.strip() != ""])
-        if len(groupes) != 2:
-            st.error("L’analyse nécessite exactement deux groupes non vides dans la colonne `groupe`.")
-            st.stop()
-
-        resultats = []
-        exports = {}
-
-        for mode_inconnu in ["exclure", "basse", "haute"]:
-            df_prop = proportion_ia_par_chaine(df_analyse, mode_inconnu=mode_inconnu)
-            exports[f"proportions_par_chaine_{mode_inconnu}.csv"] = df_prop
-
-            if df_prop.empty:
-                resultats.append({
-                    "mode_inconnu": mode_inconnu,
-                    "erreur": "Aucune donnée exploitable (par exemple trop d'inconnus en mode exclure)."
-                })
-                continue
-
-            try:
-                res = test_permutation_par_chaine(df_prop, int(n_perm), progres_callback=progres2)
-                res["mode_inconnu"] = mode_inconnu
-                res["erreur"] = ""
-                resultats.append(res)
-            except Exception as e:
-                resultats.append({
-                    "mode_inconnu": mode_inconnu,
-                    "erreur": str(e)
-                })
-
-        prog2.progress(0)
-        info2.write("")
-
-        df_res = pd.DataFrame(resultats)
-        st.write("Résultats du test de permutation (différence de moyennes des proportions par chaîne).")
-        st.dataframe(df_res, use_container_width=True)
-
-        dataframe_telechargeable(df_res, "tests_permutation.csv", "dl_tests_perm")
-
-        st.write("Proportions par chaîne (exports).")
-        for nom, dfx in exports.items():
-            st.write(nom)
-            st.dataframe(dfx, use_container_width=True)
-            dataframe_telechargeable(dfx, nom, f"dl_{nom}")
-
-        st.write(
-            "Lecture recommandée : si les trois modes (exclure, basse, haute) racontent la même histoire, ton résultat est plus robuste. "
-            "Si la conclusion change selon le traitement des inconnus, il faut le signaler explicitement et éviter de sur-interpréter."
-        )
-
-
-if __name__ == "__main__":
-    interface_principale()
+    cle_api_

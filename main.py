@@ -433,4 +433,173 @@ def interface_principale():
 
     if st.button("Tester la clé API"):
         statut = tester_cle_api(service, params)
-        if statu
+        if statut == "ok":
+            st.success("La clé API répond correctement.")
+        else:
+            st.error(
+                "La clé API ne répond pas correctement. Si ta clé est restreinte (referrers, IP, APIs activées), "
+                "il faut l’adapter dans Google Cloud Console. Consulte les logs en mode diagnostic."
+            )
+
+    st.subheader("1) Constitution du corpus")
+    mode = st.radio("Choisir un mode", ["Chaînes seed (recommandé)", "Recherche par mot-clé/hashtag (exploratoire)"], horizontal=True)
+
+    prog = st.progress(0)
+    info = st.empty()
+
+    def progres(val, texte):
+        prog.progress(min(1.0, max(0.0, float(val))))
+        info.write(texte)
+
+    df_corpus: Optional[pd.DataFrame] = None
+
+    try:
+        if mode.startswith("Chaînes"):
+            st.write("Le CSV doit contenir au minimum deux colonnes : `channel_id` et `groupe`.")
+            fichier = st.file_uploader("Importer un CSV de chaînes seed", type=["csv"])
+            max_videos = st.slider("Nombre de vidéos par chaîne", 5, 200, 50, 5)
+
+            if fichier is not None and st.button("Lancer la collecte (chaînes)", type="primary"):
+                df_ch = pd.read_csv(fichier)
+                if "channel_id" not in df_ch.columns or "groupe" not in df_ch.columns:
+                    st.error("CSV invalide. Colonnes attendues : channel_id, groupe")
+                else:
+                    df_ch = df_ch[["channel_id", "groupe"]].dropna().copy()
+                    df_ch["channel_id"] = df_ch["channel_id"].astype(str).str.strip()
+                    df_ch["groupe"] = df_ch["groupe"].astype(str).str.strip()
+                    df_ch = df_ch[(df_ch["channel_id"] != "") & (df_ch["groupe"] != "")]
+                    df_corpus = collecter_mode_chaines(service, df_ch, int(max_videos), params, progres_callback=progres)
+
+        else:
+            mode_hashtag = st.checkbox("Interpréter comme hashtag", value=True)
+            mot_cle = st.text_input("Mot-clé / hashtag", value="climatic")
+            requete = normaliser_requete(mot_cle, mode_hashtag)
+
+            region = st.text_input("RegionCode optionnel (ex: FR, US)", value="")
+            langue = st.text_input("Langue optionnelle (ex: fr, en)", value="")
+            max_resultats = st.slider("Nombre maximal de vidéos", 20, 500, 150, 10)
+
+            st.write(f"Requête utilisée : {requete if requete else '(vide)'}")
+
+            if st.button("Lancer la collecte (recherche)", type="primary"):
+                if not requete:
+                    st.error("La requête est vide. Saisis au moins un mot-clé.")
+                    st.stop()
+                region_code = region.strip() if region.strip() else None
+                relevance_lang = langue.strip() if langue.strip() else None
+                df_corpus = collecter_mode_recherche(
+                    service, requete, int(max_resultats), params, region_code, relevance_lang, progres_callback=progres
+                )
+
+    except HttpError as e:
+        st.error("Erreur YouTube Data API pendant la collecte. C’est souvent une clé invalide, une clé restreinte, ou un quota atteint.")
+        if st.session_state["mode_diag"]:
+            st.exception(e)
+        st.stop()
+    except Exception as e:
+        st.error("Erreur pendant la collecte.")
+        if st.session_state["mode_diag"]:
+            st.exception(e)
+        st.stop()
+    finally:
+        prog.progress(0)
+        info.write("")
+
+    if df_corpus is None:
+        st.stop()
+
+    if df_corpus.empty:
+        st.warning("Aucune donnée collectée. Vérifie la clé API, la requête, les identifiants, et les quotas.")
+        st.stop()
+
+    df_corpus["ia_declare_statut"] = df_corpus["containsSyntheticMedia"].apply(normaliser_statut_ia_declare)
+
+    st.subheader("2) Vérification et étiquetage des groupes")
+    st.write(
+        "En mode recherche, la colonne `groupe` est vide. Complète-la ici. "
+        "L’analyse nécessite exactement deux groupes distincts, par exemple `climatosceptique` et `climat`."
+    )
+
+    colonnes_affichees = ["video_id", "channel_title", "titre", "published_at", "ia_declare_statut", "indice_ia_texte", "groupe"]
+    df_aff = df_corpus.copy()
+    if "groupe" not in df_aff.columns:
+        df_aff["groupe"] = ""
+
+    df_edit = st.data_editor(df_aff[colonnes_affichees].copy(), use_container_width=True, num_rows="dynamic")
+    df_corpus = df_corpus.drop(columns=["groupe"], errors="ignore").merge(
+        df_edit[["video_id", "groupe"]].astype({"video_id": str}),
+        on="video_id",
+        how="left",
+    )
+
+    st.subheader("3) Export du corpus")
+    st.dataframe(df_corpus.head(200), use_container_width=True)
+    dataframe_telechargeable(df_corpus, "corpus_youtube_ia.csv", "dl_corpus")
+
+    st.subheader("4) Analyse statistique (niveau chaîne)")
+    st.write(
+        "On calcule une proportion de vidéos IA déclarées par chaîne, puis on compare deux groupes avec un test de permutation au niveau des chaînes. "
+        "Trois lectures : exclure les inconnus, borne basse (inconnu=0), borne haute (inconnu=1)."
+    )
+
+    n_perm = st.slider("Nombre de permutations", 1000, 50000, 5000, 1000)
+
+    prog2 = st.progress(0)
+    info2 = st.empty()
+
+    def progres2(val, texte):
+        prog2.progress(min(1.0, max(0.0, float(val))))
+        info2.write(texte)
+
+    if st.button("Lancer l’analyse", type="primary"):
+        df_analyse = df_corpus.copy()
+        df_analyse["groupe"] = df_analyse["groupe"].fillna("").astype(str).str.strip()
+
+        groupes = sorted([g for g in df_analyse["groupe"].unique().tolist() if g.strip() != ""])
+        if len(groupes) != 2:
+            st.error("Il faut exactement deux groupes non vides dans la colonne `groupe`.")
+            st.stop()
+
+        resultats = []
+        exports = {}
+
+        for mode_inconnu in ["exclure", "basse", "haute"]:
+            df_prop = proportion_ia_par_chaine(df_analyse, mode_inconnu=mode_inconnu)
+            exports[f"proportions_par_chaine_{mode_inconnu}.csv"] = df_prop
+
+            if df_prop.empty:
+                resultats.append({"mode_inconnu": mode_inconnu, "erreur": "Aucune donnée exploitable."})
+                continue
+
+            try:
+                res = test_permutation_par_chaine(df_prop, int(n_perm), progres_callback=progres2)
+                res["mode_inconnu"] = mode_inconnu
+                res["erreur"] = ""
+                resultats.append(res)
+            except Exception as e:
+                resultats.append({"mode_inconnu": mode_inconnu, "erreur": str(e)})
+
+        prog2.progress(0)
+        info2.write("")
+
+        df_res = pd.DataFrame(resultats)
+        st.write("Résultats du test de permutation (différence de moyennes des proportions par chaîne).")
+        st.dataframe(df_res, use_container_width=True)
+        dataframe_telechargeable(df_res, "tests_permutation.csv", "dl_tests_perm")
+
+        st.write("Exports : proportions par chaîne.")
+        for nom, dfx in exports.items():
+            st.write(nom)
+            st.dataframe(dfx, use_container_width=True)
+            dataframe_telechargeable(dfx, nom, f"dl_{nom}")
+
+
+if __name__ == "__main__":
+    try:
+        interface_principale()
+    except Exception as e:
+        st.error("Erreur fatale au lancement de l’application.")
+        if st.session_state.get("mode_diag", True):
+            st.code(traceback.format_exc())
+        else:
+            st.write(str(e))

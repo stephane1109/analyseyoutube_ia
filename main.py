@@ -219,4 +219,308 @@ def collecter_mode_chaines(service, df_chaines: pd.DataFrame, max_videos_par_cha
 
             df_vid["mode_collecte"] = "chaines_seed"
             df_vid["requete_source"] = None
-            df_vid["indice_ia_texte"] = df_vid.apply(lambda x: heuristique_indice_ia(x.get("titre"), x.get("descri
+            df_vid["indice_ia_texte"] = df_vid.apply(lambda x: heuristique_indice_ia(x.get("titre"), x.get("description")), axis=1)
+            corpus.append(df_vid)
+
+        except Exception:
+            continue
+
+    if not corpus:
+        return pd.DataFrame()
+
+    df = pd.concat(corpus, ignore_index=True)
+    df = enrichir_marqueurs(df)
+    return df
+
+
+def collecter_mode_recherche(service, requete: str, max_resultats: int, params: ParametresAPI, region_code: Optional[str], langue: Optional[str], progres_callback=None) -> pd.DataFrame:
+    video_ids: List[str] = []
+    page_token = None
+
+    while len(video_ids) < max_resultats:
+        if progres_callback:
+            progres_callback(len(video_ids) / max(1, max_resultats), f"Recherche : {len(video_ids)}/{max_resultats} vidéos")
+
+        req = service.search().list(
+            part="id",
+            q=requete,
+            type="video",
+            maxResults=min(50, max_resultats - len(video_ids)),
+            pageToken=page_token,
+            regionCode=region_code,
+            relevanceLanguage=langue,
+        )
+        rep = requete_robuste(req, nb_tentatives=params.nb_tentatives)
+
+        for it in rep.get("items", []):
+            vid = it.get("id", {}).get("videoId")
+            if vid:
+                video_ids.append(vid)
+
+        page_token = rep.get("nextPageToken")
+        if not page_token:
+            break
+
+        if params.delai_requete > 0:
+            time.sleep(params.delai_requete)
+
+    video_ids = list(dict.fromkeys(video_ids))
+    if not video_ids:
+        return pd.DataFrame()
+
+    df_vid = recuperer_details_videos(service, video_ids, params)
+    if df_vid.empty:
+        return df_vid
+
+    df_vid["mode_collecte"] = "recherche"
+    df_vid["requete_source"] = requete
+    df_vid["indice_ia_texte"] = df_vid.apply(lambda x: heuristique_indice_ia(x.get("titre"), x.get("description")), axis=1)
+
+    df_vid = enrichir_marqueurs(df_vid)
+    return df_vid
+
+
+def fusionner_marqueur_csv(df: pd.DataFrame, df_csv: pd.DataFrame, colonne_cible: str) -> pd.DataFrame:
+    """
+    Fusionne un CSV externe dans marqueur_c2pa ou marqueur_ui.
+    Le CSV doit contenir video_id et une colonne de statut.
+    Colonnes acceptées pour le statut : colonne_cible, marqueur, valeur, statut, marquage_machine.
+    """
+    d = df.copy()
+    t = df_csv.copy()
+
+    if "video_id" not in t.columns:
+        raise ValueError("Le CSV importé doit contenir une colonne video_id.")
+
+    candidates = [colonne_cible, "marqueur", "valeur", "statut", "marquage_machine"]
+    col_src = None
+    for c in candidates:
+        if c in t.columns:
+            col_src = c
+            break
+    if col_src is None:
+        raise ValueError("Le CSV importé doit contenir une colonne de statut (marqueur_c2pa, marqueur_ui, marqueur, valeur, statut, marquage_machine).")
+
+    t["video_id"] = t["video_id"].astype(str).str.strip()
+    t[col_src] = t[col_src].apply(normaliser_oui_non_inconnu)
+
+    d["video_id"] = d["video_id"].astype(str).str.strip()
+
+    t = t[["video_id", col_src]].drop_duplicates(subset=["video_id"]).rename(columns={col_src: colonne_cible})
+    d = d.merge(t, on="video_id", how="left", suffixes=("", "_csv"))
+
+    if colonne_cible not in d.columns:
+        d[colonne_cible] = "inconnu"
+
+    d[colonne_cible] = d[colonne_cible].apply(normaliser_oui_non_inconnu)
+    d = enrichir_marqueurs(d)
+    return d
+
+
+def tableau_resultats_3_marqueurs(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tableau final demandé : résultats des 3 marqueurs.
+    On calcule aussi le taux de oui sur les seules vidéos renseignées (oui+non).
+    """
+    lignes = []
+    total = int(len(df))
+
+    for col in ["marqueur_api", "marqueur_c2pa", "marqueur_ui"]:
+        s = df[col].fillna("inconnu").astype(str).str.strip()
+        vc = s.value_counts(dropna=False)
+
+        nb_oui = int(vc.get("oui", 0))
+        nb_non = int(vc.get("non", 0))
+        nb_inc = int(vc.get("inconnu", 0))
+
+        denom_renseigne = nb_oui + nb_non
+        pct_oui_sur_renseigne = (nb_oui / denom_renseigne * 100.0) if denom_renseigne > 0 else np.nan
+
+        lignes.append({
+            "marqueur": col,
+            "n_total": total,
+            "n_oui": nb_oui,
+            "n_non": nb_non,
+            "n_inconnu": nb_inc,
+            "pct_oui_total": (nb_oui / total * 100.0) if total > 0 else np.nan,
+            "pct_non_total": (nb_non / total * 100.0) if total > 0 else np.nan,
+            "pct_inconnu_total": (nb_inc / total * 100.0) if total > 0 else np.nan,
+            "pct_oui_sur_renseignes": pct_oui_sur_renseigne,
+            "n_renseignes": denom_renseigne,
+        })
+
+    return pd.DataFrame(lignes)
+
+
+def dataframe_telechargeable(df: pd.DataFrame, nom_fichier: str, cle: str):
+    csv = df.to_csv(index=False, encoding="utf-8")
+    st.download_button(
+        label=f"Télécharger {nom_fichier}",
+        data=csv.encode("utf-8"),
+        file_name=nom_fichier,
+        mime="text/csv",
+        key=cle,
+    )
+
+
+def interface():
+    st.title("YouTube : tableau des 3 marqueurs IA")
+
+    st.write(
+        "Cette application consolide trois marqueurs. Le marqueur API correspond à status.containsSyntheticMedia quand il est disponible via l’API YouTube. "
+        "Le marqueur C2PA correspond à une vérification externe des métadonnées de provenance. Le marqueur UI correspond à un label observé dans l’interface YouTube. "
+        "Le résultat demandé est un tableau unique qui résume, pour chaque marqueur, les effectifs et pourcentages en oui, non et inconnu."
+    )
+
+    st.subheader("0) Paramètres de collecte")
+    cle_api = st.text_input("Clé API YouTube (champ masqué)", value="", type="password").strip()
+    delai = st.slider("Délai entre requêtes (secondes)", 0.0, 1.0, 0.1, 0.05)
+    params = ParametresAPI(cle_api=cle_api, delai_requete=float(delai), nb_tentatives=5)
+
+    service = None
+    if cle_api:
+        try:
+            service = creer_service_youtube(cle_api)
+        except Exception:
+            service = None
+            st.error("Impossible d'initialiser le service YouTube avec cette clé API.")
+
+    mode = st.radio("Mode de collecte", ["Recherche par mot-clé ou hashtag", "Chaînes seed"], horizontal=True)
+
+    prog = st.progress(0)
+    info = st.empty()
+
+    def progres(val, texte):
+        prog.progress(min(1.0, max(0.0, float(val))))
+        info.write(texte)
+
+    if mode.startswith("Recherche"):
+        mode_hashtag = st.checkbox("Interpréter comme hashtag", value=True)
+        mot_cle = st.text_input("Mot-clé ou hashtag", value="climatic")
+        requete = normaliser_requete(mot_cle, mode_hashtag)
+
+        region = st.text_input("RegionCode optionnel (ex: FR, US)", value="")
+        langue = st.text_input("Langue optionnelle (ex: fr, en)", value="")
+        max_resultats = st.slider("Nombre maximal de vidéos", 20, 500, 150, 10)
+
+        st.write(f"Requête utilisée : {requete if requete else '(vide)'}")
+
+        lancer_collecte = st.button("Lancer la collecte", type="primary", disabled=(service is None or not requete))
+        if lancer_collecte:
+            try:
+                region_code = region.strip() if region.strip() else None
+                relevance_lang = langue.strip() if langue.strip() else None
+                df = collecter_mode_recherche(service, requete, int(max_resultats), params, region_code, relevance_lang, progres_callback=progres)
+                if df.empty:
+                    st.warning("Aucune vidéo collectée.")
+                else:
+                    st.session_state["df_corpus"] = df
+                    st.success(f"Corpus collecté : {len(df)} vidéos.")
+            except HttpError as e:
+                st.error("Erreur YouTube Data API pendant la collecte.")
+                st.write(str(e))
+            except Exception as e:
+                st.error("Erreur pendant la collecte.")
+                st.write(str(e))
+
+    else:
+        st.write("Le CSV doit contenir une colonne channel_id. La colonne groupe est optionnelle ici.")
+        fichier = st.file_uploader("CSV chaînes seed", type=["csv"])
+        max_videos = st.slider("Nombre de vidéos par chaîne", 5, 200, 50, 5)
+
+        lancer_collecte = st.button("Lancer la collecte", type="primary", disabled=(service is None or fichier is None))
+        if lancer_collecte:
+            try:
+                df_ch = pd.read_csv(fichier)
+                if "channel_id" not in df_ch.columns:
+                    st.error("CSV invalide. Il faut une colonne channel_id.")
+                else:
+                    df_ch = df_ch[["channel_id"]].dropna().copy()
+                    df_ch["channel_id"] = df_ch["channel_id"].astype(str).str.strip()
+                    df_ch = df_ch[df_ch["channel_id"] != ""]
+                    df = collecter_mode_chaines(service, df_ch, int(max_videos), params, progres_callback=progres)
+                    if df.empty:
+                        st.warning("Aucune vidéo collectée.")
+                    else:
+                        st.session_state["df_corpus"] = df
+                        st.success(f"Corpus collecté : {len(df)} vidéos.")
+            except HttpError as e:
+                st.error("Erreur YouTube Data API pendant la collecte.")
+                st.write(str(e))
+            except Exception as e:
+                st.error("Erreur pendant la collecte.")
+                st.write(str(e))
+
+    prog.progress(0)
+    info.write("")
+
+    st.subheader("1) Tableau des résultats des 3 marqueurs")
+    df_corpus = st.session_state.get("df_corpus", None)
+
+    if df_corpus is None or df_corpus.empty:
+        st.info("Aucun corpus en mémoire. Lance une collecte.")
+        return
+
+    df_corpus = enrichir_marqueurs(df_corpus)
+    st.session_state["df_corpus"] = df_corpus
+
+    tableau = tableau_resultats_3_marqueurs(df_corpus)
+    st.dataframe(tableau, use_container_width=True)
+    dataframe_telechargeable(tableau, "resultats_3_marqueurs.csv", "dl_tableau")
+
+    st.subheader("2) Import optionnel des marqueurs C2PA et UI")
+    st.write(
+        "Si tu as un CSV externe issu d’une vérification C2PA ou d’une observation UI, tu peux l’importer pour remplir marqueur_c2pa ou marqueur_ui par video_id."
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        fichier_c2pa = st.file_uploader("Importer CSV C2PA (video_id + statut)", type=["csv"], key="c2pa")
+        if fichier_c2pa is not None:
+            try:
+                df_csv = pd.read_csv(fichier_c2pa)
+                df_corpus = fusionner_marqueur_csv(df_corpus, df_csv, "marqueur_c2pa")
+                st.session_state["df_corpus"] = df_corpus
+                st.success("C2PA fusionné.")
+            except Exception as e:
+                st.error("Erreur fusion C2PA.")
+                st.write(str(e))
+
+    with col2:
+        fichier_ui = st.file_uploader("Importer CSV UI (video_id + statut)", type=["csv"], key="ui")
+        if fichier_ui is not None:
+            try:
+                df_csv = pd.read_csv(fichier_ui)
+                df_corpus = fusionner_marqueur_csv(df_corpus, df_csv, "marqueur_ui")
+                st.session_state["df_corpus"] = df_corpus
+                st.success("UI fusionné.")
+            except Exception as e:
+                st.error("Erreur fusion UI.")
+                st.write(str(e))
+
+    st.subheader("3) Corpus (édition manuelle C2PA/UI si besoin)")
+    st.write("Tu peux corriger manuellement marqueur_c2pa et marqueur_ui. Le marqueur API est recalculé automatiquement à partir de containsSyntheticMedia.")
+
+    colonnes_aff = [
+        "video_id", "channel_title", "titre", "published_at",
+        "marqueur_api", "marqueur_c2pa", "marqueur_ui",
+        "indice_ia_texte",
+    ]
+
+    df_aff = st.session_state["df_corpus"].copy()
+    df_edit = st.data_editor(df_aff[colonnes_aff].copy(), use_container_width=True, num_rows="dynamic")
+
+    df_maj = df_aff.drop(columns=["marqueur_c2pa", "marqueur_ui"], errors="ignore").merge(
+        df_edit[["video_id", "marqueur_c2pa", "marqueur_ui"]].astype({"video_id": str}),
+        on="video_id",
+        how="left"
+    )
+    df_maj = enrichir_marqueurs(df_maj)
+    st.session_state["df_corpus"] = df_maj
+
+    dataframe_telechargeable(df_maj, "corpus_youtube_marqueurs.csv", "dl_corpus")
+
+
+if __name__ == "__main__":
+    interface()

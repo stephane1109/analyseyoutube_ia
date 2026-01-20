@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -12,7 +11,8 @@ import streamlit as st
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-st.set_page_config(page_title="YouTube : IA et climat (Streamlit Cloud)", layout="wide")
+
+st.set_page_config(page_title="YouTube : tableau des 3 marqueurs IA", layout="wide")
 
 
 @dataclass
@@ -43,6 +43,10 @@ def requete_robuste(appel, nb_tentatives: int = 5, pause_initiale: float = 1.0):
             pause *= 2
 
 
+def creer_service_youtube(cle_api: str):
+    return build("youtube", "v3", developerKey=cle_api, cache_discovery=False)
+
+
 def _safe_int(x) -> Optional[int]:
     try:
         if x is None:
@@ -54,7 +58,7 @@ def _safe_int(x) -> Optional[int]:
 
 def heuristique_indice_ia(titre: str, description: str) -> int:
     """
-    Indicateur exploratoire basé sur le texte (signal secondaire).
+    Indice secondaire basé sur le texte (non probant, mais utile à l’exploration).
     """
     t = ((titre or "") + " " + (description or "")).lower()
     mots = [
@@ -65,12 +69,14 @@ def heuristique_indice_ia(titre: str, description: str) -> int:
     return 1 if any(m in t for m in mots) else 0
 
 
-def normaliser_statut_oui_non_inconnu(valeur: object) -> str:
+def normaliser_oui_non_inconnu(valeur: object) -> str:
     """
-    Normalise une valeur vers {oui, non, inconnu}.
-    Accepte notamment True/False/None et des variantes textuelles.
+    Normalise vers {oui, non, inconnu}.
+    Accepte booléens, None, et quelques variantes textuelles.
     """
-    if valeur is None or (isinstance(valeur, float) and np.isnan(valeur)):
+    if valeur is None:
+        return "inconnu"
+    if isinstance(valeur, float) and np.isnan(valeur):
         return "inconnu"
     if valeur is True:
         return "oui"
@@ -78,7 +84,7 @@ def normaliser_statut_oui_non_inconnu(valeur: object) -> str:
         return "non"
 
     s = str(valeur).strip().lower()
-    if s in ["oui", "yes", "true", "1", "present", "présent", "present(e)", "présente"]:
+    if s in ["oui", "yes", "true", "1", "present", "présent", "présente", "present(e)"]:
         return "oui"
     if s in ["non", "no", "false", "0", "absent", "absente", "absent(e)"]:
         return "non"
@@ -87,17 +93,32 @@ def normaliser_statut_oui_non_inconnu(valeur: object) -> str:
     return "inconnu"
 
 
-@st.cache_resource(show_spinner=False)
-def creer_service_youtube(cle_api: str):
-    return build("youtube", "youtube", developerKey=cle_api, cache_discovery=False)
-
-
-def creer_service_youtube(cle_api: str):
+def enrichir_marqueurs(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Certains environnements Streamlit Cloud supportent mieux un cache_resource explicite,
-    d'autres préfèrent un service direct. On garde une fonction simple et robuste.
+    Ajoute/normalise les colonnes des 3 marqueurs :
+    marqueur_api  : dérivé de status.containsSyntheticMedia (API YouTube)
+    marqueur_c2pa : à renseigner par import CSV ou édition manuelle
+    marqueur_ui   : à renseigner par import CSV ou édition manuelle
     """
-    return build("youtube", "v3", developerKey=cle_api, cache_discovery=False)
+    d = df.copy()
+
+    if "containsSyntheticMedia" in d.columns:
+        d["marqueur_api"] = d["containsSyntheticMedia"].apply(normaliser_oui_non_inconnu)
+    else:
+        d["marqueur_api"] = "inconnu"
+
+    if "marqueur_c2pa" not in d.columns:
+        d["marqueur_c2pa"] = "inconnu"
+    d["marqueur_c2pa"] = d["marqueur_c2pa"].apply(normaliser_oui_non_inconnu)
+
+    if "marqueur_ui" not in d.columns:
+        d["marqueur_ui"] = "inconnu"
+    d["marqueur_ui"] = d["marqueur_ui"].apply(normaliser_oui_non_inconnu)
+
+    if "indice_ia_texte" not in d.columns:
+        d["indice_ia_texte"] = d.apply(lambda x: heuristique_indice_ia(x.get("titre"), x.get("description")), axis=1)
+
+    return d
 
 
 def recuperer_playlist_uploads(service, channel_id: str, params: ParametresAPI) -> str:
@@ -112,6 +133,7 @@ def recuperer_playlist_uploads(service, channel_id: str, params: ParametresAPI) 
 def lister_videos_playlist(service, playlist_id: str, max_videos: int, params: ParametresAPI) -> List[str]:
     video_ids: List[str] = []
     page_token = None
+
     while True:
         req = service.playlistItems().list(
             part="contentDetails",
@@ -120,6 +142,7 @@ def lister_videos_playlist(service, playlist_id: str, max_videos: int, params: P
             pageToken=page_token,
         )
         rep = requete_robuste(req, nb_tentatives=params.nb_tentatives)
+
         for it in rep.get("items", []):
             video_ids.append(it["contentDetails"]["videoId"])
             if len(video_ids) >= max_videos:
@@ -137,6 +160,7 @@ def lister_videos_playlist(service, playlist_id: str, max_videos: int, params: P
 
 def recuperer_details_videos(service, video_ids: List[str], params: ParametresAPI) -> pd.DataFrame:
     lignes: List[Dict] = []
+
     for i in range(0, len(video_ids), 50):
         lot = video_ids[i:i + 50]
         req = service.videos().list(
@@ -145,6 +169,7 @@ def recuperer_details_videos(service, video_ids: List[str], params: ParametresAP
             maxResults=50
         )
         rep = requete_robuste(req, nb_tentatives=params.nb_tentatives)
+
         for v in rep.get("items", []):
             sn = v.get("snippet", {})
             stt = v.get("statistics", {})
@@ -172,44 +197,12 @@ def recuperer_details_videos(service, video_ids: List[str], params: ParametresAP
     return pd.DataFrame(lignes)
 
 
-def enrichir_marqueurs(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ajoute/normalise les trois marqueurs :
-    - marqueur_api : basé sur containsSyntheticMedia (oui/non/inconnu)
-    - marqueur_c2pa : par défaut inconnu (modifiable par import CSV ou édition)
-    - marqueur_ui : par défaut inconnu (modifiable par import CSV ou édition)
-    """
-    d = df.copy()
-
-    d["marqueur_api"] = d.get("containsSyntheticMedia", None).apply(normaliser_statut_oui_non_inconnu)
-
-    if "marqueur_c2pa" not in d.columns:
-        d["marqueur_c2pa"] = "inconnu"
-    else:
-        d["marqueur_c2pa"] = d["marqueur_c2pa"].apply(normaliser_statut_oui_non_inconnu)
-
-    if "marqueur_ui" not in d.columns:
-        d["marqueur_ui"] = "inconnu"
-    else:
-        d["marqueur_ui"] = d["marqueur_ui"].apply(normaliser_statut_oui_non_inconnu)
-
-    if "groupe" not in d.columns:
-        d["groupe"] = ""
-    d["groupe"] = d["groupe"].fillna("").astype(str).str.strip()
-
-    if "indice_ia_texte" not in d.columns:
-        d["indice_ia_texte"] = d.apply(lambda x: heuristique_indice_ia(x.get("titre"), x.get("description")), axis=1)
-
-    return d
-
-
 def collecter_mode_chaines(service, df_chaines: pd.DataFrame, max_videos_par_chaine: int, params: ParametresAPI, progres_callback=None) -> pd.DataFrame:
     corpus = []
     total = len(df_chaines)
 
     for i, r in df_chaines.reset_index(drop=True).iterrows():
         channel_id = str(r["channel_id"]).strip()
-        groupe = str(r["groupe"]).strip()
 
         if progres_callback:
             progres_callback((i + 1) / max(1, total), f"Collecte chaîne {i + 1}/{total} : {channel_id}")
@@ -224,475 +217,6 @@ def collecter_mode_chaines(service, df_chaines: pd.DataFrame, max_videos_par_cha
             if df_vid.empty:
                 continue
 
-            df_vid["groupe"] = groupe
             df_vid["mode_collecte"] = "chaines_seed"
             df_vid["requete_source"] = None
-            df_vid["indice_ia_texte"] = df_vid.apply(lambda x: heuristique_indice_ia(x.get("titre"), x.get("description")), axis=1)
-            corpus.append(df_vid)
-        except Exception:
-            continue
-
-    if not corpus:
-        return pd.DataFrame()
-
-    df = pd.concat(corpus, ignore_index=True)
-    df = enrichir_marqueurs(df)
-    return df
-
-
-def collecter_mode_recherche(service, requete: str, max_resultats: int, params: ParametresAPI, region_code: Optional[str], langue: Optional[str], progres_callback=None) -> pd.DataFrame:
-    video_ids: List[str] = []
-    page_token = None
-
-    while len(video_ids) < max_resultats:
-        if progres_callback:
-            progres_callback(len(video_ids) / max(1, max_resultats), f"Recherche : {len(video_ids)}/{max_resultats} vidéos")
-
-        req = service.search().list(
-            part="id",
-            q=requete,
-            type="video",
-            maxResults=min(50, max_resultats - len(video_ids)),
-            pageToken=page_token,
-            regionCode=region_code,
-            relevanceLanguage=langue,
-        )
-        rep = requete_robuste(req, nb_tentatives=params.nb_tentatives)
-        for it in rep.get("items", []):
-            vid = it.get("id", {}).get("videoId")
-            if vid:
-                video_ids.append(vid)
-
-        page_token = rep.get("nextPageToken")
-        if not page_token:
-            break
-
-        if params.delai_requete > 0:
-            time.sleep(params.delai_requete)
-
-    video_ids = list(dict.fromkeys(video_ids))
-    if not video_ids:
-        return pd.DataFrame()
-
-    df_vid = recuperer_details_videos(service, video_ids, params)
-    if df_vid.empty:
-        return df_vid
-
-    df_vid["mode_collecte"] = "recherche"
-    df_vid["requete_source"] = requete
-    df_vid["indice_ia_texte"] = df_vid.apply(lambda x: heuristique_indice_ia(x.get("titre"), x.get("description")), axis=1)
-    df_vid = enrichir_marqueurs(df_vid)
-    return df_vid
-
-
-def fusionner_marqueur_csv(df: pd.DataFrame, df_csv: pd.DataFrame, colonne_cible: str) -> pd.DataFrame:
-    """
-    Fusion générique d'un CSV vers une colonne marqueur (marqueur_c2pa ou marqueur_ui).
-    Le CSV doit contenir au minimum : video_id et une colonne de marqueur.
-    La colonne de marqueur peut s'appeler :
-    - marqueur_c2pa / marqueur_ui
-    - marquage_machine (compatibilité ancienne)
-    - valeur / marqueur
-    """
-    d = df.copy()
-    t = df_csv.copy()
-
-    if "video_id" not in t.columns:
-        raise ValueError("Le CSV importé doit contenir une colonne video_id.")
-
-    candidates = [colonne_cible, "marquage_machine", "marqueur", "valeur", "statut"]
-    col_src = None
-    for c in candidates:
-        if c in t.columns:
-            col_src = c
-            break
-    if col_src is None:
-        raise ValueError("Le CSV importé doit contenir une colonne marqueur (ex: marqueur_c2pa, marqueur_ui, marquage_machine, marqueur, valeur, statut).")
-
-    t["video_id"] = t["video_id"].astype(str).str.strip()
-    t[col_src] = t[col_src].apply(normaliser_statut_oui_non_inconnu)
-
-    d["video_id"] = d["video_id"].astype(str).str.strip()
-    t = t[["video_id", col_src]].drop_duplicates(subset=["video_id"]).copy()
-    t = t.rename(columns={col_src: colonne_cible})
-
-    d = d.merge(t, on="video_id", how="left", suffixes=("", "_csv"))
-
-    if colonne_cible not in d.columns:
-        d[colonne_cible] = "inconnu"
-
-    d[colonne_cible] = d[colonne_cible].apply(normaliser_statut_oui_non_inconnu)
-    d = enrichir_marqueurs(d)
-    return d
-
-
-def tableau_recap_marqueurs(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Donne un récapitulatif des statuts pour les trois marqueurs.
-    """
-    lignes = []
-    for col in ["marqueur_api", "marqueur_c2pa", "marqueur_ui"]:
-        vc = df[col].fillna("inconnu").astype(str).str.strip().value_counts(dropna=False)
-        lignes.append({
-            "marqueur": col,
-            "oui": int(vc.get("oui", 0)),
-            "non": int(vc.get("non", 0)),
-            "inconnu": int(vc.get("inconnu", 0)),
-        })
-    return pd.DataFrame(lignes)
-
-
-def proportion_marqueur_par_chaine(df: pd.DataFrame, colonne_marqueur: str, mode_inconnu: str) -> pd.DataFrame:
-    """
-    Calcule la proportion du marqueur (oui=1, non=0) par chaîne.
-    mode_inconnu :
-    - exclure : on ignore les inconnus
-    - basse : inconnu=0
-    - haute : inconnu=1
-    """
-    d = df.copy()
-    if colonne_marqueur not in d.columns:
-        return pd.DataFrame(columns=["channel_id", "channel_title", "groupe", "proportion", "n_videos"])
-
-    s = d[colonne_marqueur].apply(normaliser_statut_oui_non_inconnu)
-
-    def to_num(x: str):
-        if x == "oui":
-            return 1.0
-        if x == "non":
-            return 0.0
-        return np.nan
-
-    y = s.apply(to_num)
-    d["_y"] = y
-
-    if mode_inconnu == "basse":
-        d["_y2"] = d["_y"].fillna(0.0)
-    elif mode_inconnu == "haute":
-        d["_y2"] = d["_y"].fillna(1.0)
-    else:
-        d = d.dropna(subset=["_y"]).copy()
-        d["_y2"] = d["_y"]
-
-    if d.empty:
-        return pd.DataFrame(columns=["channel_id", "channel_title", "groupe", "proportion", "n_videos"])
-
-    agg = d.groupby(["channel_id", "channel_title", "groupe"]).agg(
-        proportion=("_y2", "mean"),
-        n_videos=("video_id", "count"),
-    ).reset_index()
-
-    return agg
-
-
-def test_permutation_par_chaine(df_prop: pd.DataFrame, n_permutations: int, graine: int = 42, progres_callback=None) -> Dict:
-    dfp = df_prop.dropna(subset=["proportion", "groupe"]).copy()
-    dfp["groupe"] = dfp["groupe"].astype(str).str.strip()
-    groupes = sorted([g for g in dfp["groupe"].unique().tolist() if g != ""])
-    if len(groupes) != 2:
-        raise ValueError("Il faut exactement 2 groupes non vides dans la colonne 'groupe'.")
-
-    g1, g2 = groupes[0], groupes[1]
-    x = dfp["proportion"].to_numpy(dtype=float)
-    labels = dfp["groupe"].to_numpy(dtype=str)
-
-    obs = float(x[labels == g1].mean() - x[labels == g2].mean())
-
-    rng = np.random.default_rng(graine)
-    compte = 0
-    bloc = 500
-    nb_blocs = int(math.ceil(n_permutations / bloc))
-
-    for b in range(nb_blocs):
-        debut = b * bloc
-        fin = min(n_permutations, (b + 1) * bloc)
-
-        for _ in range(debut, fin):
-            perm = rng.permutation(labels)
-            diff = float(x[perm == g1].mean() - x[perm == g2].mean())
-            if abs(diff) >= abs(obs):
-                compte += 1
-
-        if progres_callback:
-            progres_callback((b + 1) / max(1, nb_blocs), f"Permutation : {fin}/{n_permutations}")
-
-    p_value = (compte + 1) / (n_permutations + 1)
-    return {
-        "difference_moyennes": float(obs),
-        "p_value": float(p_value),
-        "groupe_1": g1,
-        "groupe_2": g2,
-        "n_permutations": int(n_permutations),
-    }
-
-
-def dataframe_telechargeable(df: pd.DataFrame, nom_fichier: str, cle: str):
-    csv = df.to_csv(index=False, encoding="utf-8")
-    st.download_button(
-        label=f"Télécharger {nom_fichier}",
-        data=csv.encode("utf-8"),
-        file_name=nom_fichier,
-        mime="text/csv",
-        key=cle,
-    )
-
-
-def interface():
-    st.title("YouTube : détection de signaux IA et étude de contenus sur le climat")
-
-    st.subheader("Marqueurs disponibles dans l’application")
-    st.write(
-        "Cette interface met à disposition trois marqueurs complémentaires. Le premier est technique et provient des données YouTube lorsque ce champ est "
-        "accessible. Le second concerne les métadonnées de provenance (C2PA) et dépend d’une vérification externe du fichier. Le troisième concerne "
-        "les indices visibles dans l’interface YouTube et repose sur l’observation."
-    )
-    st.write(
-        "Marqueur technique API et code source. La variable exploitée est status.containsSyntheticMedia. Lorsqu’elle est disponible, le script la convertit "
-        "en oui, non ou inconnu dans la colonne marqueur_api. Ce marqueur correspond à une divulgation de contenu altéré ou synthétique."
-    )
-    st.write(
-        "Marqueur de métadonnées C2PA. Il s’agit d’un manifeste de provenance intégré au fichier par certains outils. La colonne marqueur_c2pa doit être "
-        "renseignée par import CSV (video_id et valeur) ou par édition manuelle après vérification externe du fichier."
-    )
-    st.write(
-        "Indicateurs visuels dans l’interface YouTube. Certains contextes affichent une mention ou un label lié au contenu synthétique. La colonne marqueur_ui "
-        "peut être renseignée par import CSV ou par édition manuelle lorsque l’observateur constate le label."
-    )
-
-    st.subheader("0) Clé API")
-    cle_api = st.text_input("Clé API YouTube (champ masqué)", value="", type="password").strip()
-    if not cle_api:
-        st.info("Renseigne une clé API pour activer les boutons de collecte.")
-        service = None
-    else:
-        try:
-            service = creer_service_youtube(cle_api)
-        except Exception:
-            service = None
-            st.error("Impossible d'initialiser le service YouTube avec cette clé API.")
-
-    delai = st.slider("Délai entre requêtes (secondes)", 0.0, 1.0, 0.1, 0.05)
-    params = ParametresAPI(cle_api=cle_api, delai_requete=float(delai), nb_tentatives=5)
-
-    st.subheader("1) Collecte")
-    mode = st.radio("Mode", ["Chaînes seed (recommandé)", "Recherche par mot-clé ou hashtag (exploratoire)"], horizontal=True)
-
-    prog = st.progress(0)
-    info = st.empty()
-
-    def progres(val, texte):
-        prog.progress(min(1.0, max(0.0, float(val))))
-        info.write(texte)
-
-    if mode.startswith("Chaînes"):
-        st.write("Le mode chaînes seed utilise un CSV avec au minimum channel_id et groupe. Il permet un échantillonnage reproductible.")
-        fichier = st.file_uploader("CSV chaînes seed (channel_id,groupe)", type=["csv"])
-        max_videos = st.slider("Nombre de vidéos par chaîne", 5, 200, 50, 5)
-        lancer_collecte = st.button("Lancer la collecte (chaînes)", type="primary", disabled=(service is None or fichier is None))
-
-        if lancer_collecte:
-            try:
-                df_ch = pd.read_csv(fichier)
-                if "channel_id" not in df_ch.columns or "groupe" not in df_ch.columns:
-                    st.error("CSV invalide. Colonnes attendues : channel_id, groupe")
-                else:
-                    df_ch = df_ch[["channel_id", "groupe"]].dropna().copy()
-                    df_ch["channel_id"] = df_ch["channel_id"].astype(str).str.strip()
-                    df_ch["groupe"] = df_ch["groupe"].astype(str).str.strip()
-                    df_ch = df_ch[(df_ch["channel_id"] != "") & (df_ch["groupe"] != "")]
-                    df_corpus = collecter_mode_chaines(service, df_ch, int(max_videos), params, progres_callback=progres)
-                    if df_corpus.empty:
-                        st.warning("Aucune vidéo collectée (chaînes inaccessibles, quotas, ou identifiants invalides).")
-                    else:
-                        st.session_state["df_corpus"] = df_corpus
-                        st.success(f"Corpus collecté : {len(df_corpus)} vidéos.")
-            except HttpError as e:
-                st.error("Erreur YouTube Data API pendant la collecte.")
-                st.write(str(e))
-            except Exception as e:
-                st.error("Erreur pendant la collecte.")
-                st.write(str(e))
-
-    else:
-        st.write("Ce mode construit un corpus exploratoire à partir d'un mot-clé ou d'un hashtag.")
-        mode_hashtag = st.checkbox("Interpréter comme hashtag", value=True)
-        mot_cle = st.text_input("Mot-clé ou hashtag", value="climatic")
-        requete = normaliser_requete(mot_cle, mode_hashtag)
-
-        region = st.text_input("RegionCode optionnel (ex: FR, US)", value="")
-        langue = st.text_input("Langue optionnelle (ex: fr, en)", value="")
-        max_resultats = st.slider("Nombre maximal de vidéos", 20, 500, 150, 10)
-
-        st.write(f"Requête utilisée : {requete if requete else '(vide)'}")
-
-        lancer_collecte = st.button("Lancer la collecte (recherche)", type="primary", disabled=(service is None or not requete))
-
-        if lancer_collecte:
-            try:
-                region_code = region.strip() if region.strip() else None
-                relevance_lang = langue.strip() if langue.strip() else None
-                df_corpus = collecter_mode_recherche(service, requete, int(max_resultats), params, region_code, relevance_lang, progres_callback=progres)
-                if df_corpus.empty:
-                    st.warning("Aucune vidéo collectée (requête trop restrictive, quotas, ou clé invalide).")
-                else:
-                    st.session_state["df_corpus"] = df_corpus
-                    st.success(f"Corpus collecté : {len(df_corpus)} vidéos.")
-            except HttpError as e:
-                st.error("Erreur YouTube Data API pendant la collecte.")
-                st.write(str(e))
-            except Exception as e:
-                st.error("Erreur pendant la collecte.")
-                st.write(str(e))
-
-    prog.progress(0)
-    info.write("")
-
-    st.subheader("2) Corpus, import de marqueurs et étiquetage")
-
-    df_corpus = st.session_state.get("df_corpus", None)
-    if df_corpus is None or df_corpus.empty:
-        st.info("Aucun corpus en mémoire. Lance une collecte.")
-    else:
-        df_corpus = enrichir_marqueurs(df_corpus)
-        st.session_state["df_corpus"] = df_corpus
-
-        st.write("Récapitulatif des trois marqueurs dans le corpus.")
-        st.dataframe(tableau_recap_marqueurs(df_corpus), use_container_width=True)
-
-        st.write("Import optionnel d'un CSV pour renseigner marqueur_c2pa (liaison par video_id).")
-        fichier_c2pa = st.file_uploader("Importer CSV C2PA (video_id + marqueur_c2pa ou marquage_machine)", type=["csv"], key="c2pa")
-        if fichier_c2pa is not None:
-            try:
-                df_csv = pd.read_csv(fichier_c2pa)
-                df_corpus = fusionner_marqueur_csv(df_corpus, df_csv, "marqueur_c2pa")
-                st.session_state["df_corpus"] = df_corpus
-                st.success("Fusion C2PA réalisée.")
-            except Exception as e:
-                st.error("Erreur pendant la fusion C2PA.")
-                st.write(str(e))
-
-        st.write("Import optionnel d'un CSV pour renseigner marqueur_ui (liaison par video_id).")
-        fichier_ui = st.file_uploader("Importer CSV UI (video_id + marqueur_ui)", type=["csv"], key="ui")
-        if fichier_ui is not None:
-            try:
-                df_csv = pd.read_csv(fichier_ui)
-                df_corpus = fusionner_marqueur_csv(df_corpus, df_csv, "marqueur_ui")
-                st.session_state["df_corpus"] = df_corpus
-                st.success("Fusion UI réalisée.")
-            except Exception as e:
-                st.error("Erreur pendant la fusion UI.")
-                st.write(str(e))
-
-        st.write("Édition manuelle des groupes et des marqueurs C2PA/UI. Le marqueur API est recalculé automatiquement.")
-        colonnes = [
-            "video_id", "channel_title", "titre", "published_at",
-            "marqueur_api", "marqueur_c2pa", "marqueur_ui",
-            "indice_ia_texte", "groupe",
-        ]
-
-        df_aff = df_corpus.copy()
-        df_edit = st.data_editor(df_aff[colonnes].copy(), use_container_width=True, num_rows="dynamic")
-
-        df_maj = df_corpus.drop(columns=["groupe", "marqueur_c2pa", "marqueur_ui"], errors="ignore").merge(
-            df_edit[["video_id", "groupe", "marqueur_c2pa", "marqueur_ui"]].astype({"video_id": str}),
-            on="video_id",
-            how="left"
-        )
-
-        df_maj = enrichir_marqueurs(df_maj)
-        st.session_state["df_corpus"] = df_maj
-        df_corpus = df_maj
-
-        dataframe_telechargeable(df_corpus, "corpus_youtube_marqueurs.csv", "dl_corpus")
-
-    st.subheader("3) Analyse")
-    df_corpus = st.session_state.get("df_corpus", None)
-
-    analyse_possible = False
-    groupes = []
-    if df_corpus is not None and not df_corpus.empty and "groupe" in df_corpus.columns:
-        groupes = sorted([g for g in df_corpus["groupe"].fillna("").astype(str).str.strip().unique().tolist() if g != ""])
-        analyse_possible = (len(groupes) == 2)
-
-    st.write(f"Groupes détectés : {', '.join(groupes) if groupes else '(aucun)'}")
-    n_perm = st.slider("Nombre de permutations", 1000, 50000, 5000, 1000)
-
-    prog2 = st.progress(0)
-    info2 = st.empty()
-
-    def progres2(val, texte):
-        prog2.progress(min(1.0, max(0.0, float(val))))
-        info2.write(texte)
-
-    lancer_analyse = st.button("Analyser", type="primary", disabled=(not analyse_possible))
-
-    if lancer_analyse:
-        try:
-            resultats = []
-            exports = {}
-
-            marqueurs = ["marqueur_api", "marqueur_c2pa", "marqueur_ui"]
-            modes = ["exclure", "basse", "haute"]
-
-            total_etapes = len(marqueurs) * len(modes)
-            etape = 0
-
-            for m in marqueurs:
-                for mode_inconnu in modes:
-                    etape += 1
-                    progres2(etape / max(1, total_etapes), f"Préparation {m} ({mode_inconnu}) : {etape}/{total_etapes}")
-
-                    df_prop = proportion_marqueur_par_chaine(df_corpus, colonne_marqueur=m, mode_inconnu=mode_inconnu)
-                    exports[f"proportions_{m}_{mode_inconnu}.csv"] = df_prop
-
-                    if df_prop.empty:
-                        resultats.append({
-                            "marqueur": m,
-                            "mode_inconnu": mode_inconnu,
-                            "difference_moyennes": None,
-                            "p_value": None,
-                            "groupe_1": None,
-                            "groupe_2": None,
-                            "n_permutations": int(n_perm),
-                            "erreur": "Aucune donnée exploitable.",
-                        })
-                        continue
-
-                    try:
-                        res = test_permutation_par_chaine(df_prop, int(n_perm), progres_callback=progres2)
-                        res["marqueur"] = m
-                        res["mode_inconnu"] = mode_inconnu
-                        res["erreur"] = ""
-                        resultats.append(res)
-                    except Exception as e:
-                        resultats.append({
-                            "marqueur": m,
-                            "mode_inconnu": mode_inconnu,
-                            "difference_moyennes": None,
-                            "p_value": None,
-                            "groupe_1": None,
-                            "groupe_2": None,
-                            "n_permutations": int(n_perm),
-                            "erreur": str(e),
-                        })
-
-            prog2.progress(0)
-            info2.write("")
-
-            df_res = pd.DataFrame(resultats)
-            st.dataframe(df_res, use_container_width=True)
-            dataframe_telechargeable(df_res, "tests_permutation_marqueurs.csv", "dl_tests_perm")
-
-            st.write("Exports : proportions par chaîne pour chaque marqueur et chaque mode.")
-            for nom, dfx in exports.items():
-                st.write(nom)
-                st.dataframe(dfx, use_container_width=True)
-                dataframe_telechargeable(dfx, nom, f"dl_{nom}")
-
-        except Exception as e:
-            st.error("Erreur pendant l'analyse.")
-            st.write(str(e))
-
-
-if __name__ == "__main__":
-    interface()
+            df_vid["indice_ia_texte"] = df_vid.apply(lambda x: heuristique_indice_ia(x.get("titre"), x.get("descri
